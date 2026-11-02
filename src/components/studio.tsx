@@ -18,6 +18,7 @@ import {
   formatStamp,
   SAMPLE_FPS,
   transcribeVideo,
+  type Engine,
   type LayoutMode,
   type Region,
   type ScanStatus,
@@ -43,14 +44,19 @@ const MODES: { id: LayoutMode; label: string }[] = [
   { id: "sparse", label: "零散文字" },
 ];
 
+const ENGINES: { id: Engine; label: string }[] = [
+  { id: "paddle", label: "检测识别" },
+  { id: "tesseract", label: "整页识别" },
+];
+
 const PREF_KEY = "zhenxi-prefs";
 
 type Phase = "idle" | "preparing" | "ready" | "loading" | "running" | "done" | "error";
 
-type Prefs = { langs: string; region: Region; mode: LayoutMode };
+type Prefs = { langs: string; region: Region; mode: LayoutMode; engine: Engine };
 
 function readPrefs(): Prefs {
-  const fallback: Prefs = { langs: "chi_sim+eng", region: "full", mode: "auto" };
+  const fallback: Prefs = { langs: "chi_sim+eng", region: "full", mode: "auto", engine: "paddle" };
   try {
     const raw = localStorage.getItem(PREF_KEY);
     if (!raw) return fallback;
@@ -59,6 +65,7 @@ function readPrefs(): Prefs {
       langs: LANGS.some((item) => item.id === parsed.langs) ? parsed.langs! : fallback.langs,
       region: REGIONS.some((item) => item.id === parsed.region) ? parsed.region! : fallback.region,
       mode: MODES.some((item) => item.id === parsed.mode) ? parsed.mode! : fallback.mode,
+      engine: ENGINES.some((item) => item.id === parsed.engine) ? parsed.engine! : fallback.engine,
     };
   } catch {
     return fallback;
@@ -98,7 +105,7 @@ export function Studio() {
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const urlRef = useRef<string | null>(null);
-  const prefsRef = useRef<Prefs>({ langs: "chi_sim+eng", region: "full", mode: "auto" });
+  const prefsRef = useRef<Prefs>({ langs: "chi_sim+eng", region: "full", mode: "auto", engine: "paddle" });
   const rangeRef = useRef({ start: "", end: "" });
 
   const [phase, setPhase] = useState<Phase>("idle");
@@ -109,6 +116,7 @@ export function Studio() {
   const [langs, setLangs] = useState(prefsRef.current.langs);
   const [region, setRegion] = useState<Region>(prefsRef.current.region);
   const [mode, setMode] = useState<LayoutMode>(prefsRef.current.mode);
+  const [engine, setEngine] = useState<Engine>(prefsRef.current.engine);
   const [startAt, setStartAt] = useState("");
   const [endAt, setEndAt] = useState("");
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -120,7 +128,7 @@ export function Studio() {
   const [hydrated, setHydrated] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
 
-  prefsRef.current = { langs, region, mode };
+  prefsRef.current = { langs, region, mode, engine };
   rangeRef.current = { start: startAt, end: endAt };
 
   useEffect(() => {
@@ -128,13 +136,14 @@ export function Studio() {
     setLangs(prefs.langs);
     setRegion(prefs.region);
     setMode(prefs.mode);
+    setEngine(prefs.engine);
     setHydrated(true);
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem(PREF_KEY, JSON.stringify({ langs, region, mode }));
-  }, [hydrated, langs, region, mode]);
+    localStorage.setItem(PREF_KEY, JSON.stringify({ langs, region, mode, engine }));
+  }, [hydrated, langs, region, mode, engine]);
 
   useEffect(() => {
     urlRef.current = url;
@@ -210,6 +219,7 @@ export function Studio() {
         langs: prefs.langs,
         region: prefs.region,
         mode: prefs.mode,
+        engine: prefs.engine,
         startRaw: range.start,
         endRaw: range.end,
         signal: controller.signal,
@@ -223,7 +233,11 @@ export function Studio() {
       if (result.stopped) {
         setNote("已停止，保留了已经识别出的文字。");
       } else if (result.segments.length === 0) {
-        setNote("没有识别到文字。可以改成「底部字幕」或「成块文字」再试。");
+        setNote(
+          prefsRef.current.engine === "paddle"
+            ? "没有识别到文字。可以改成「全画面」，或换「整页识别」再试。"
+            : "没有识别到文字。可以改成「底部字幕」或「成块文字」再试。",
+        );
       } else {
         setNote("");
       }
@@ -295,14 +309,14 @@ export function Studio() {
         </div>
       </header>
       <p className="mt-4 max-w-2xl text-muted">
-        按每秒两帧拆开画面，读出上面的字。字幕、标题、课件、包装都能抽，视频只留在这台设备上。
+        按每秒五帧拆开画面，读出上面的字。字幕、标题、课件、包装都能抽，视频只留在这台设备上。
       </p>
       <ol className="steps">
         <li>
           <span>1</span>放入视频
         </li>
         <li>
-          <span>2</span>每秒拆两帧
+          <span>2</span>每秒拆五帧
         </li>
         <li>
           <span>3</span>带时间的文稿
@@ -417,6 +431,28 @@ export function Studio() {
             </label>
 
             <div>
+              <p className="mb-1 text-sm text-muted">引擎</p>
+              <div className="seg" role="group" aria-label="识别引擎">
+                {ENGINES.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    aria-pressed={engine === item.id}
+                    disabled={busy}
+                    onClick={() => setEngine(item.id)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1 text-sm text-muted">
+                {engine === "paddle"
+                  ? "先框出每一行再识别，同一句用多帧投票。第一次要下载模型。"
+                  : "整页交给 Tesseract，不单独检测文字位置。"}
+              </p>
+            </div>
+
+            <div>
               <p className="mb-1 text-sm text-muted">识别区域</p>
               <div className="seg" role="group" aria-label="识别区域">
                 {REGIONS.map((item) => (
@@ -441,7 +477,7 @@ export function Studio() {
                     key={item.id}
                     type="button"
                     aria-pressed={mode === item.id}
-                    disabled={busy}
+                    disabled={busy || engine === "paddle"}
                     onClick={() => setMode(item.id)}
                   >
                     {item.label}
@@ -514,7 +550,7 @@ export function Studio() {
               固定每秒 {SAMPLE_FPS} 帧
               {duration != null ? ` · 片长 ${formatStamp(duration)} · 约 ${frames} 帧` : ""}
             </p>
-            {frames > 240 ? (
+            {frames > 600 ? (
               <p className="text-sm text-primary">这段比较长，识别会花一些时间，可以先填开始和结束。</p>
             ) : null}
 

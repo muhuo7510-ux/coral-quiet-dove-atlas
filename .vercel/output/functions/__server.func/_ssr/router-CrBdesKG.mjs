@@ -2,7 +2,7 @@ import { o as __toESM } from "../_runtime.mjs";
 import { _ as lazyRouteComponent, b as useRouter, f as Scripts, g as Outlet, h as createRouter, p as HeadContent, q as require_react, v as createFileRoute, x as require_jsx_runtime, y as createRootRoute } from "../_libs/@tanstack/react-router+[...].mjs";
 import { n as TriangleAlert } from "../_libs/lucide-react.mjs";
 import { a as union, i as string, n as number, r as object, t as literal } from "../_libs/zod.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/router-olBZHlVG.js
+//#region node_modules/.nitro/vite/services/ssr/assets/router-CrBdesKG.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var __defProp = Object.defineProperty;
@@ -353,7 +353,7 @@ var Route$1 = createRootRoute({
 			{ title: APP_NAME },
 			{
 				name: "description",
-				content: "每秒抽取两帧，在浏览器本地识别视频画面中的文字。"
+				content: "每秒抽取五帧，在浏览器本地识别视频画面中的文字。"
 			},
 			{
 				name: "theme-color",
@@ -404,7 +404,7 @@ var Route$1 = createRootRoute({
 		] })]
 	})
 });
-var $$splitComponentImporter = () => import("./routes-D0jt6gcK.mjs");
+var $$splitComponentImporter = () => import("./routes-Y-QIdY1I.mjs");
 var rootRouteChildren = { IndexRoute: createFileRoute("/")({ component: lazyRouteComponent($$splitComponentImporter, "component") }).update({
 	id: "/",
 	path: "/",

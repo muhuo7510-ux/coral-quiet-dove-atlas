@@ -13,7 +13,7 @@ export const Route = createRootRoute({
       { title: APP_NAME },
       {
         name: "description",
-        content: "每秒抽取两帧，在浏览器本地识别视频画面中的文字。",
+        content: "每秒抽取五帧，在浏览器本地识别视频画面中的文字。",
       },
       { name: "theme-color", content: "#141210" },
     ],

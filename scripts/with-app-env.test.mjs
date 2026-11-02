@@ -7,6 +7,8 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import {
   APP_ENV_REL_PATH,
+  launchSpec,
+  localPackageBin,
   mergeAppEnv,
   parseAppEnv,
   projectRoot,
@@ -71,6 +73,23 @@ test("vite loadEnv resolves the wrapped value", () => {
   const root = makeWorkspace('{"VITE_AUTH_ENABLED":"false"}');
   const merged = mergeAppEnv(readAppEnv(root), { PATH: "/usr/bin" });
   assert.equal(merged.VITE_AUTH_ENABLED, "false");
+});
+
+test("a local package bin is launched through node, not the .cmd shim", () => {
+  const file = localPackageBin(projectRoot(), "vite");
+  assert.match(file, /[\\/]node_modules[\\/]vite[\\/]bin[\\/]vite\.js$/);
+  const spec = launchSpec(projectRoot(), "vite", ["dev", "--host", "0.0.0.0", "--port", "8080"]);
+  assert.equal(spec.command, process.execPath);
+  assert.equal(spec.shell, false);
+  assert.equal(spec.args[0], file);
+  assert.deepEqual(spec.args.slice(1), ["dev", "--host", "0.0.0.0", "--port", "8080"]);
+});
+
+test("an absolute executable is not rewritten as a package bin", () => {
+  assert.equal(localPackageBin(projectRoot(), process.execPath), null);
+  const spec = launchSpec(projectRoot(), process.execPath, ["-e", "1"]);
+  assert.equal(spec.command, process.execPath);
+  assert.deepEqual(spec.args, ["-e", "1"]);
 });
 
 test("the wrapped command runs with the app env applied", async () => {

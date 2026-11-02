@@ -1,9 +1,9 @@
 import { o as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime } from "../_libs/@tanstack/react-router+[...].mjs";
 import { a as LoaderCircle, c as Clapperboard, i as ScanText, l as ChevronDown, o as Download, r as Square, s as Copy, t as Upload } from "../_libs/lucide-react.mjs";
-import { n as previewPathPrefix } from "./router-olBZHlVG.mjs";
+import { n as previewPathPrefix } from "./router-CrBdesKG.mjs";
 import { n as toast, t as Toaster } from "../_libs/sonner.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-D0jt6gcK.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-Y-QIdY1I.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 /** Root-absolute URL, with the path-based preview prefix when the host uses one. */
@@ -12,7 +12,70 @@ function assetUrl(path) {
 	if (typeof window === "undefined") return clean;
 	return `${previewPathPrefix(window.location.hostname, window.location.pathname) ?? ""}${clean}`;
 }
-var SAMPLE_STEP = 1 / 2;
+var sessions = /* @__PURE__ */ new Map();
+function paddleLang(langs) {
+	if (langs.startsWith("chi_tra")) return "chinese_cht";
+	if (langs.startsWith("jpn")) return "japan";
+	if (langs === "eng") return "en";
+	return "ch";
+}
+function loadPaddle(langs) {
+	const lang = paddleLang(langs);
+	const cached = sessions.get(lang);
+	if (cached) return cached;
+	const pending = import("../_libs/@paddleocr/paddleocr-js+[...].mjs").then((n) => n.t).then(({ PaddleOCR }) => PaddleOCR.create({
+		lang,
+		ocrVersion: "PP-OCRv5",
+		worker: false,
+		textRecScoreThresh: .3,
+		textDetThresh: .3,
+		textDetBoxThresh: .4,
+		textDetUnclipRatio: 1.6,
+		ortOptions: {
+			backend: "wasm",
+			wasmPaths: assetUrl("/ort/"),
+			numThreads: 1,
+			simd: true,
+			proxy: false,
+			disableWasmProxy: true
+		}
+	})).then((ocr) => ocr);
+	sessions.set(lang, pending);
+	pending.catch(() => {
+		sessions.delete(lang);
+	});
+	return pending;
+}
+function meaningful$1(text) {
+	if ((text.match(/\p{Script=Han}/gu) ?? []).length >= 1) return true;
+	if (text.replace(/[^A-Za-z]/g, "").length >= 2) return true;
+	if (text.replace(/\D/g, "").length >= 2) return true;
+	return false;
+}
+async function recognizePaddle(session, canvas) {
+	const [page] = await session.predict(canvas, {
+		textRecScoreThresh: .3,
+		textDetThresh: .3,
+		textDetBoxThresh: .4,
+		textDetUnclipRatio: 1.6
+	});
+	const lines = (page?.items ?? []).map((item) => ({
+		text: (item.text || "").replace(/[|¦]/g, "").trim(),
+		score: item.score ?? 0,
+		y: item.poly?.[0]?.[1] ?? 0,
+		x: item.poly?.[0]?.[0] ?? 0
+	})).filter((line) => line.text && line.score >= .3 && meaningful$1(line.text)).sort((a, b) => a.y - b.y || a.x - b.x);
+	if (lines.length === 0) return {
+		text: "",
+		confidence: 0
+	};
+	const confidence = lines.reduce((sum, line) => sum + line.score, 0) / lines.length * 100;
+	return {
+		text: lines.map((line) => line.text).join("\n"),
+		confidence
+	};
+}
+var SAMPLE_STEP = 1 / 5;
 var STATUS_LABEL = {
 	"loading tesseract core": "正在加载识别引擎",
 	"initializing tesseract": "正在初始化",
@@ -137,11 +200,39 @@ function shouldMerge(prev, next) {
 	if (long.includes(short) && short.length / long.length >= .6) return true;
 	return dice(a, b) >= .82;
 }
-function prefer(prev, next, prevC, nextC) {
-	if (nextC > prevC + 5) return next;
-	if (prevC > nextC + 5) return prev;
-	const prevLen = prev.replace(/\s/g, "").length;
-	return next.replace(/\s/g, "").length > prevLen ? next : prev;
+function castVote(ballots, id, text, confidence) {
+	const list = ballots.get(id) ?? [];
+	const key = normalize(text);
+	const found = list.find((item) => normalize(item.text) === key);
+	if (found) {
+		found.count += 1;
+		if (confidence > found.confidence || confidence === found.confidence && text.length > found.text.length) {
+			found.confidence = confidence;
+			found.text = text;
+		}
+	} else list.push({
+		text,
+		confidence,
+		count: 1
+	});
+	ballots.set(id, list);
+	let best = list[0];
+	let bestRank = -Infinity;
+	let samples = 0;
+	for (const item of list) {
+		samples += item.count;
+		const len = item.text.replace(/\s/g, "").length;
+		const rank = item.count * 12 + item.confidence + Math.min(len, 24);
+		if (rank > bestRank) {
+			best = item;
+			bestRank = rank;
+		}
+	}
+	return {
+		text: best.text,
+		confidence: Math.round(best.confidence),
+		samples
+	};
 }
 function meanDiff(a, b) {
 	let diff = 0;
@@ -311,41 +402,63 @@ async function transcribeVideo(args) {
 		label: "正在准备识别模型",
 		progress: 0
 	});
-	const createWorker = await loadCreateWorker();
-	let worker = null;
 	const segments = [];
+	const ballots = /* @__PURE__ */ new Map();
 	let seq = 0;
 	let stopped = false;
+	let worker = null;
+	let paddle = null;
 	try {
-		worker = await createWorker(args.langs, 1, {
-			workerPath: assetUrl("/tesseract/worker.min.js"),
-			corePath: assetUrl("/tesseract-core"),
-			langPath: assetUrl("/tessdata"),
-			gzip: true,
-			workerBlobURL: true,
-			logger: (message) => {
-				const status = message.status ?? "";
-				if (status === "recognizing text") return;
-				onStatus({
-					kind: "model",
-					label: STATUS_LABEL[status] ?? "正在准备识别模型",
-					progress: message.progress ?? 0
-				});
+		if (args.engine === "paddle") {
+			onStatus({
+				kind: "model",
+				label: "正在加载检测模型，第一次会下载",
+				progress: .2
+			});
+			paddle = await loadPaddle(args.langs);
+			if (signal.aborted) {
+				stopped = true;
+				return {
+					segments,
+					stopped
+				};
 			}
-		});
-		if (signal.aborted) {
-			stopped = true;
-			return {
-				segments,
-				stopped
-			};
+			onStatus({
+				kind: "model",
+				label: "检测模型已就绪",
+				progress: 1
+			});
+		} else {
+			worker = await (await loadCreateWorker())(args.langs, 1, {
+				workerPath: assetUrl("/tesseract/worker.min.js"),
+				corePath: assetUrl("/tesseract-core"),
+				langPath: assetUrl("/tessdata"),
+				gzip: true,
+				workerBlobURL: true,
+				logger: (message) => {
+					const status = message.status ?? "";
+					if (status === "recognizing text") return;
+					onStatus({
+						kind: "model",
+						label: STATUS_LABEL[status] ?? "正在准备识别模型",
+						progress: message.progress ?? 0
+					});
+				}
+			});
+			if (signal.aborted) {
+				stopped = true;
+				return {
+					segments,
+					stopped
+				};
+			}
+			const psm = args.mode === "block" ? "6" : args.mode === "sparse" ? "11" : "3";
+			await worker.setParameters({
+				tessedit_pageseg_mode: psm,
+				user_defined_dpi: "150",
+				preserve_interword_spaces: "1"
+			});
 		}
-		const psm = args.mode === "block" ? "6" : args.mode === "sparse" ? "11" : "3";
-		await worker.setParameters({
-			tessedit_pageseg_mode: psm,
-			user_defined_dpi: "150",
-			preserve_interword_spaces: "1"
-		});
 		const frameCanvas = document.createElement("canvas");
 		const ocrCanvas = document.createElement("canvas");
 		const hashCanvas = document.createElement("canvas");
@@ -400,7 +513,7 @@ async function transcribeVideo(args) {
 			let confidence = 0;
 			try {
 				paintOcr(frameCanvas, ocrCanvas, args.region);
-				const read = pageText((await worker.recognize(ocrCanvas, {}, {
+				const read = paddle ? await recognizePaddle(paddle, ocrCanvas) : pageText((await worker.recognize(ocrCanvas, {}, {
 					text: true,
 					blocks: true
 				})).data);
@@ -419,25 +532,30 @@ async function transcribeVideo(args) {
 			else {
 				const last = segments[segments.length - 1];
 				if (last && t - last.end <= 1.05 && shouldMerge(last.text, text)) {
+					const voted = castVote(ballots, last.id, text, confidence);
 					last.end = end;
-					last.text = prefer(last.text, text, last.confidence, confidence);
-					last.confidence = Math.round(Math.max(last.confidence, confidence));
-					last.samples += 1;
-				} else segments.push({
-					id: `s${seq++}`,
-					start: t,
-					end,
-					text,
-					confidence: Math.round(confidence),
-					samples: 1,
-					thumb: makeThumb(video, thumbCanvas)
-				});
+					last.text = voted.text;
+					last.confidence = voted.confidence;
+					last.samples = voted.samples;
+				} else {
+					const id = `s${seq++}`;
+					const voted = castVote(ballots, id, text, confidence);
+					segments.push({
+						id,
+						start: t,
+						end,
+						text: voted.text,
+						confidence: voted.confidence,
+						samples: voted.samples,
+						thumb: makeThumb(video, thumbCanvas)
+					});
+				}
 				holdingText = true;
 				onSegments(segments.map((item) => ({ ...item })));
 			}
 			onStatus({
 				kind: "scan",
-				label: "正在读字",
+				label: paddle ? "正在检测并读字" : "正在读字",
 				progress: (index + 1) / times.length,
 				frame: index + 1,
 				total: times.length,
@@ -446,6 +564,7 @@ async function transcribeVideo(args) {
 			});
 		}
 	} catch (err) {
+		console.error(err);
 		throw new Error(explain(err));
 	} finally {
 		if (worker) try {
@@ -503,12 +622,20 @@ var MODES = [
 		label: "零散文字"
 	}
 ];
+var ENGINES = [{
+	id: "paddle",
+	label: "检测识别"
+}, {
+	id: "tesseract",
+	label: "整页识别"
+}];
 var PREF_KEY = "zhenxi-prefs";
 function readPrefs() {
 	const fallback = {
 		langs: "chi_sim+eng",
 		region: "full",
-		mode: "auto"
+		mode: "auto",
+		engine: "paddle"
 	};
 	try {
 		const raw = localStorage.getItem(PREF_KEY);
@@ -517,7 +644,8 @@ function readPrefs() {
 		return {
 			langs: LANGS.some((item) => item.id === parsed.langs) ? parsed.langs : fallback.langs,
 			region: REGIONS.some((item) => item.id === parsed.region) ? parsed.region : fallback.region,
-			mode: MODES.some((item) => item.id === parsed.mode) ? parsed.mode : fallback.mode
+			mode: MODES.some((item) => item.id === parsed.mode) ? parsed.mode : fallback.mode,
+			engine: ENGINES.some((item) => item.id === parsed.engine) ? parsed.engine : fallback.engine
 		};
 	} catch {
 		return fallback;
@@ -555,7 +683,8 @@ function Studio() {
 	const prefsRef = (0, import_react.useRef)({
 		langs: "chi_sim+eng",
 		region: "full",
-		mode: "auto"
+		mode: "auto",
+		engine: "paddle"
 	});
 	const rangeRef = (0, import_react.useRef)({
 		start: "",
@@ -569,6 +698,7 @@ function Studio() {
 	const [langs, setLangs] = (0, import_react.useState)(prefsRef.current.langs);
 	const [region, setRegion] = (0, import_react.useState)(prefsRef.current.region);
 	const [mode, setMode] = (0, import_react.useState)(prefsRef.current.mode);
+	const [engine, setEngine] = (0, import_react.useState)(prefsRef.current.engine);
 	const [startAt, setStartAt] = (0, import_react.useState)("");
 	const [endAt, setEndAt] = (0, import_react.useState)("");
 	const [segments, setSegments] = (0, import_react.useState)([]);
@@ -582,7 +712,8 @@ function Studio() {
 	prefsRef.current = {
 		langs,
 		region,
-		mode
+		mode,
+		engine
 	};
 	rangeRef.current = {
 		start: startAt,
@@ -593,6 +724,7 @@ function Studio() {
 		setLangs(prefs.langs);
 		setRegion(prefs.region);
 		setMode(prefs.mode);
+		setEngine(prefs.engine);
 		setHydrated(true);
 	}, []);
 	(0, import_react.useEffect)(() => {
@@ -600,13 +732,15 @@ function Studio() {
 		localStorage.setItem(PREF_KEY, JSON.stringify({
 			langs,
 			region,
-			mode
+			mode,
+			engine
 		}));
 	}, [
 		hydrated,
 		langs,
 		region,
-		mode
+		mode,
+		engine
 	]);
 	(0, import_react.useEffect)(() => {
 		urlRef.current = url;
@@ -682,6 +816,7 @@ function Studio() {
 				langs: prefs.langs,
 				region: prefs.region,
 				mode: prefs.mode,
+				engine: prefs.engine,
 				startRaw: range.start,
 				endRaw: range.end,
 				signal: controller.signal,
@@ -693,7 +828,7 @@ function Studio() {
 			});
 			setPhase("done");
 			if (result.stopped) setNote("已停止，保留了已经识别出的文字。");
-			else if (result.segments.length === 0) setNote("没有识别到文字。可以改成「底部字幕」或「成块文字」再试。");
+			else if (result.segments.length === 0) setNote(prefsRef.current.engine === "paddle" ? "没有识别到文字。可以改成「全画面」，或换「整页识别」再试。" : "没有识别到文字。可以改成「底部字幕」或「成块文字」再试。");
 			else setNote("");
 		} catch (err) {
 			if (controller.signal.aborted) {
@@ -758,7 +893,7 @@ function Studio() {
 						className: "badge",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
 							className: "text-primary",
-							children: 2
+							children: 5
 						}), "帧/秒"]
 					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 						className: "badge",
@@ -768,13 +903,13 @@ function Studio() {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 				className: "mt-4 max-w-2xl text-muted",
-				children: "按每秒两帧拆开画面，读出上面的字。字幕、标题、课件、包装都能抽，视频只留在这台设备上。"
+				children: "按每秒五帧拆开画面，读出上面的字。字幕、标题、课件、包装都能抽，视频只留在这台设备上。"
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("ol", {
 				className: "steps",
 				children: [
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "1" }), "放入视频"] }),
-					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "2" }), "每秒拆两帧"] }),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "2" }), "每秒拆五帧"] }),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "3" }), "带时间的文稿"] })
 				]
 			}),
@@ -897,6 +1032,28 @@ function Studio() {
 										})]
 									})]
 								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+										className: "mb-1 text-sm text-muted",
+										children: "引擎"
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "seg",
+										role: "group",
+										"aria-label": "识别引擎",
+										children: ENGINES.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+											type: "button",
+											"aria-pressed": engine === item.id,
+											disabled: busy,
+											onClick: () => setEngine(item.id),
+											children: item.label
+										}, item.id))
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+										className: "mt-1 text-sm text-muted",
+										children: engine === "paddle" ? "先框出每一行再识别，同一句用多帧投票。第一次要下载模型。" : "整页交给 Tesseract，不单独检测文字位置。"
+									})
+								] }),
 								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 									className: "mb-1 text-sm text-muted",
 									children: "识别区域"
@@ -922,7 +1079,7 @@ function Studio() {
 									children: MODES.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 										type: "button",
 										"aria-pressed": mode === item.id,
-										disabled: busy,
+										disabled: busy || engine === "paddle",
 										onClick: () => setMode(item.id),
 										children: item.label
 									}, item.id))
@@ -987,12 +1144,12 @@ function Studio() {
 									className: "text-sm text-muted tabular-nums",
 									children: [
 										"固定每秒 ",
-										2,
+										5,
 										" 帧",
 										duration != null ? ` · 片长 ${formatStamp(duration)} · 约 ${frames} 帧` : ""
 									]
 								}),
-								frames > 240 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								frames > 600 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 									className: "text-sm text-primary",
 									children: "这段比较长，识别会花一些时间，可以先填开始和结束。"
 								}) : null,

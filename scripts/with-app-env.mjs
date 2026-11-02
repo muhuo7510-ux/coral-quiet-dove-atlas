@@ -20,7 +20,7 @@
  * `process.env`, which is why the merge has to happen before Vite starts.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,6 +87,41 @@ export function projectRoot() {
   return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
+const BARE_COMMAND = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * JS entry of a locally installed package bin, or null.
+ *
+ * On Windows `spawn("vite")` does not resolve `node_modules/.bin/vite.cmd`
+ * (ENOENT) even after `npm install`. Launching the package's JS bin with
+ * this Node binary avoids the `.cmd` shim on every platform.
+ */
+export function localPackageBin(root, command) {
+  if (!BARE_COMMAND.test(command)) return null;
+  const pkgPath = join(root, "node_modules", command, "package.json");
+  if (!existsSync(pkgPath)) return null;
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const bin = pkg.bin;
+  const rel = typeof bin === "string" ? bin : bin && typeof bin === "object" ? bin[command] : null;
+  if (typeof rel !== "string" || rel.length === 0) return null;
+  const file = join(root, "node_modules", command, rel);
+  return existsSync(file) ? file : null;
+}
+
+/** How to spawn `command`: a local JS bin via node, otherwise the command itself. */
+export function launchSpec(root, command, args) {
+  const jsBin = localPackageBin(root, command);
+  if (jsBin) {
+    return { command: process.execPath, args: [jsBin, ...args], shell: false };
+  }
+  return { command, args, shell: process.platform === "win32" };
+}
+
 /**
  * Whether `moduleUrl` is the script node was asked to run.
  *
@@ -110,14 +145,26 @@ function main(argv) {
     console.error("usage: node scripts/with-app-env.mjs <command> [args…]");
     process.exit(2);
   }
-  const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  const root = projectRoot();
+  const env = mergeAppEnv(readAppEnv(root), process.env);
+  const spec = launchSpec(root, command, args);
+  const child = spawn(spec.command, spec.args, {
+    stdio: "inherit",
+    env,
+    shell: spec.shell,
+    windowsHide: true,
+  });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));
   }
   child.on("error", (err) => {
     console.error(`[with-app-env] failed to run ${command}:`, err?.message || err);
+    if (err && err.code === "ENOENT") {
+      console.error(
+        `[with-app-env] 找不到 ${command}。请先在项目目录执行 npm install，确认存在 node_modules。`,
+      );
+    }
     process.exit(127);
   });
   child.on("exit", (code, signal) => {

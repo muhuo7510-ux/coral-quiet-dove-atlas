@@ -1,6 +1,9 @@
 import { assetUrl } from "@/lib/asset-url";
+import { loadPaddle, recognizePaddle, type Engine } from "@/lib/paddle-read";
 
-export const SAMPLE_FPS = 2;
+export type { Engine };
+
+export const SAMPLE_FPS = 5;
 export const SAMPLE_STEP = 1 / SAMPLE_FPS;
 
 export type Region = "full" | "bottom" | "top";
@@ -193,12 +196,40 @@ function shouldMerge(prev: string, next: string): boolean {
   return dice(a, b) >= 0.82;
 }
 
-function prefer(prev: string, next: string, prevC: number, nextC: number): string {
-  if (nextC > prevC + 5) return next;
-  if (prevC > nextC + 5) return prev;
-  const prevLen = prev.replace(/\s/g, "").length;
-  const nextLen = next.replace(/\s/g, "").length;
-  return nextLen > prevLen ? next : prev;
+type Vote = { text: string; confidence: number; count: number };
+
+function castVote(
+  ballots: Map<string, Vote[]>,
+  id: string,
+  text: string,
+  confidence: number,
+): { text: string; confidence: number; samples: number } {
+  const list = ballots.get(id) ?? [];
+  const key = normalize(text);
+  const found = list.find((item) => normalize(item.text) === key);
+  if (found) {
+    found.count += 1;
+    if (confidence > found.confidence || (confidence === found.confidence && text.length > found.text.length)) {
+      found.confidence = confidence;
+      found.text = text;
+    }
+  } else {
+    list.push({ text, confidence, count: 1 });
+  }
+  ballots.set(id, list);
+  let best = list[0]!;
+  let bestRank = -Infinity;
+  let samples = 0;
+  for (const item of list) {
+    samples += item.count;
+    const len = item.text.replace(/\s/g, "").length;
+    const rank = item.count * 12 + item.confidence + Math.min(len, 24);
+    if (rank > bestRank) {
+      best = item;
+      bestRank = rank;
+    }
+  }
+  return { text: best.text, confidence: Math.round(best.confidence), samples };
 }
 
 function meanDiff(a: Uint8Array, b: Uint8Array): number {
@@ -379,8 +410,11 @@ async function loadCreateWorker() {
 
 function explain(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
+  if (/wasm|no available backend|ort-/i.test(msg)) {
+    return "识别组件没有加载成功，请刷新后再试";
+  }
   if (/network|fetch|failed to load|importScripts|Response code/i.test(msg)) {
-    return "识别引擎加载失败，请刷新后再试";
+    return "模型没有加载成功，请再试一次";
   }
   return msg || "解析失败";
 }
@@ -390,6 +424,7 @@ export async function transcribeVideo(args: {
   langs: string;
   region: Region;
   mode: LayoutMode;
+  engine: Engine;
   startRaw: string;
   endRaw: string;
   signal: AbortSignal;
@@ -427,39 +462,51 @@ export async function transcribeVideo(args: {
   if (times.length === 0) times.push(from);
 
   onStatus({ kind: "model", label: "正在准备识别模型", progress: 0 });
-  const createWorker = await loadCreateWorker();
-  let worker: OcrWorker | null = null;
   const segments: Segment[] = [];
+  const ballots = new Map<string, Vote[]>();
   let seq = 0;
   let stopped = false;
+  let worker: OcrWorker | null = null;
+  let paddle: Awaited<ReturnType<typeof loadPaddle>> | null = null;
 
   try {
-    worker = await createWorker(args.langs, 1, {
-      workerPath: assetUrl("/tesseract/worker.min.js"),
-      corePath: assetUrl("/tesseract-core"),
-      langPath: assetUrl("/tessdata"),
-      gzip: true,
-      workerBlobURL: true,
-      logger: (message: { status?: string; progress?: number }) => {
-        const status = message.status ?? "";
-        if (status === "recognizing text") return;
-        onStatus({
-          kind: "model",
-          label: STATUS_LABEL[status] ?? "正在准备识别模型",
-          progress: message.progress ?? 0,
-        });
-      },
-    });
-    if (signal.aborted) {
-      stopped = true;
-      return { segments, stopped };
+    if (args.engine === "paddle") {
+      onStatus({ kind: "model", label: "正在加载检测模型，第一次会下载", progress: 0.2 });
+      paddle = await loadPaddle(args.langs);
+      if (signal.aborted) {
+        stopped = true;
+        return { segments, stopped };
+      }
+      onStatus({ kind: "model", label: "检测模型已就绪", progress: 1 });
+    } else {
+      const createWorker = await loadCreateWorker();
+      worker = await createWorker(args.langs, 1, {
+        workerPath: assetUrl("/tesseract/worker.min.js"),
+        corePath: assetUrl("/tesseract-core"),
+        langPath: assetUrl("/tessdata"),
+        gzip: true,
+        workerBlobURL: true,
+        logger: (message: { status?: string; progress?: number }) => {
+          const status = message.status ?? "";
+          if (status === "recognizing text") return;
+          onStatus({
+            kind: "model",
+            label: STATUS_LABEL[status] ?? "正在准备识别模型",
+            progress: message.progress ?? 0,
+          });
+        },
+      });
+      if (signal.aborted) {
+        stopped = true;
+        return { segments, stopped };
+      }
+      const psm = args.mode === "block" ? "6" : args.mode === "sparse" ? "11" : "3";
+      await worker.setParameters({
+        tessedit_pageseg_mode: psm,
+        user_defined_dpi: "150",
+        preserve_interword_spaces: "1",
+      });
     }
-    const psm = args.mode === "block" ? "6" : args.mode === "sparse" ? "11" : "3";
-    await worker.setParameters({
-      tessedit_pageseg_mode: psm,
-      user_defined_dpi: "150",
-      preserve_interword_spaces: "1",
-    });
 
     const frameCanvas = document.createElement("canvas");
     const ocrCanvas = document.createElement("canvas");
@@ -524,8 +571,9 @@ export async function transcribeVideo(args: {
       let confidence = 0;
       try {
         paintOcr(frameCanvas, ocrCanvas, args.region);
-        const result = await worker.recognize(ocrCanvas, {}, { text: true, blocks: true });
-        const read = pageText(result.data);
+        const read = paddle
+          ? await recognizePaddle(paddle, ocrCanvas)
+          : pageText((await worker!.recognize(ocrCanvas, {}, { text: true, blocks: true })).data);
         text = read.text;
         confidence = read.confidence;
         fails = 0;
@@ -544,18 +592,21 @@ export async function transcribeVideo(args: {
       } else {
         const last = segments[segments.length - 1];
         if (last && t - last.end <= 1.05 && shouldMerge(last.text, text)) {
+          const voted = castVote(ballots, last.id, text, confidence);
           last.end = end;
-          last.text = prefer(last.text, text, last.confidence, confidence);
-          last.confidence = Math.round(Math.max(last.confidence, confidence));
-          last.samples += 1;
+          last.text = voted.text;
+          last.confidence = voted.confidence;
+          last.samples = voted.samples;
         } else {
+          const id = `s${seq++}`;
+          const voted = castVote(ballots, id, text, confidence);
           segments.push({
-            id: `s${seq++}`,
+            id,
             start: t,
             end,
-            text,
-            confidence: Math.round(confidence),
-            samples: 1,
+            text: voted.text,
+            confidence: voted.confidence,
+            samples: voted.samples,
             thumb: makeThumb(video, thumbCanvas),
           });
         }
@@ -565,7 +616,7 @@ export async function transcribeVideo(args: {
 
       onStatus({
         kind: "scan",
-        label: "正在读字",
+        label: paddle ? "正在检测并读字" : "正在读字",
         progress: (index + 1) / times.length,
         frame: index + 1,
         total: times.length,
@@ -574,6 +625,7 @@ export async function transcribeVideo(args: {
       });
     }
   } catch (err) {
+    console.error(err);
     throw new Error(explain(err));
   } finally {
     if (worker) {

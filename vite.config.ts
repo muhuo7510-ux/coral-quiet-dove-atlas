@@ -1,5 +1,5 @@
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { extname, join } from "node:path";
 import type { Plugin } from "vite";
 import { defineConfig } from "vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
@@ -11,6 +11,44 @@ import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
 // @ts-expect-error JS plugin alongside the TS vite config
 import { appEnvPlugin } from "./scripts/app-env-plugin.mjs";
 import { isMigrationFile } from "./scripts/migration-plan.mjs";
+
+function ortPublicPlugin(): Plugin {
+  return {
+    name: "app-builder:ort-public",
+    enforce: "pre",
+    configureServer(server) {
+      const root = server.config.root;
+      server.middlewares.use((req, res, next) => {
+        const pathOnly = (req.url ?? "").split("?", 1)[0] ?? "";
+        if (!pathOnly.startsWith("/ort/")) {
+          next();
+          return;
+        }
+        const rel = pathOnly.replace(/^\/+/, "");
+        const file = join(root, "public", rel);
+        const ortDir = join(root, "public", "ort");
+        if (!file.startsWith(ortDir) || !existsSync(file)) {
+          next();
+          return;
+        }
+        const type =
+          extname(file) === ".wasm"
+            ? "application/wasm"
+            : extname(file) === ".mjs"
+              ? "text/javascript"
+              : "application/octet-stream";
+        res.setHeader("Content-Type", type);
+        res.end(readFileSync(file));
+      });
+      const stack = server.middlewares.stack;
+      const layer = stack[stack.length - 1];
+      if (layer) {
+        stack.pop();
+        stack.unshift(layer);
+      }
+    },
+  };
+}
 
 /** The files `src/lib/db.ts` globs — same directory, same non-recursive scope. */
 function hasGlobbedMigrations(root: string): boolean {
@@ -157,7 +195,11 @@ export default defineConfig(({ command, isPreview }) => ({
     strictPort: true,
   },
   resolve: { tsconfigPaths: true },
+  optimizeDeps: {
+    exclude: ["onnxruntime-web"],
+  },
   plugins: [
+    ortPublicPlugin(),
     pgliteBootstrapPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),
